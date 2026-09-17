@@ -1,11 +1,123 @@
 import time
 import math
+import json
+from pathlib import Path
+import sys
 import pygame
 import numpy as np
 from pygame.locals import *
 
 from OpenGL.GL import *
 from OpenGL.GLU import *
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from control import (  # noqa: E402
+        CONTROL_DT,
+        CONTROL_HZ,
+        FixedRateScheduler,
+        PID,
+        approach,
+        load_poses,
+        load_settings,
+        save_json,
+    )
+except ModuleNotFoundError as error:
+    if error.name != "control":
+        raise
+
+    CONTROL_HZ = 50.0
+    CONTROL_DT = 1.0 / CONTROL_HZ
+    DEFAULT_SETTINGS = {
+        "control_hz": CONTROL_HZ,
+        "max_joint_speed": 90.0,
+        "posture_bias": 0.08,
+        "minimum_target_y": -0.35,
+        "pid": {
+            "p": [5.0, 6.0, 6.0, 4.0],
+            "i": [0.0, 0.0, 0.0, 0.0],
+            "d": [0.35, 0.45, 0.45, 0.30],
+            "integral_limit": 10.0,
+            "output_limit": 180.0,
+        },
+    }
+    DEFAULT_POSES = [{
+        "name": "home",
+        "target": {"x": 0.0, "y": 1.0, "z": -9.0},
+        "orientation": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "angles": [0.0, 0.0, 0.0, 0.0],
+    }]
+
+    def _fallback_copy(value):
+        return json.loads(json.dumps(value))
+
+    def _fallback_load(path, defaults):
+        try:
+            with Path(path).open("r", encoding="utf-8") as stream:
+                value = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            return _fallback_copy(defaults)
+        return value if isinstance(value, type(defaults)) else _fallback_copy(defaults)
+
+    def load_settings(path):
+        settings = _fallback_load(path, DEFAULT_SETTINGS)
+        settings["control_hz"] = CONTROL_HZ
+        settings["max_joint_speed"] = max(1.0, float(settings["max_joint_speed"]))
+        settings["posture_bias"] = max(0.0, float(settings["posture_bias"]))
+        return settings
+
+    def load_poses(path):
+        poses = _fallback_load(path, DEFAULT_POSES)
+        return poses if isinstance(poses, list) and poses else _fallback_copy(DEFAULT_POSES)
+
+    def save_json(path, value):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+
+    class PID:
+        def __init__(self, kp, ki, kd, integral_limit=10.0, output_limit=180.0):
+            self.kp = float(kp)
+            self.ki = float(ki)
+            self.kd = float(kd)
+            self.integral_limit = abs(float(integral_limit))
+            self.output_limit = abs(float(output_limit))
+            self.reset()
+
+        def reset(self):
+            self.integral = 0.0
+            self.previous_error = None
+
+        def update(self, target, measured, dt=CONTROL_DT):
+            error = float(target) - float(measured)
+            self.integral += error * dt
+            self.integral = max(-self.integral_limit, min(self.integral_limit, self.integral))
+            derivative = 0.0 if self.previous_error is None else (error - self.previous_error) / dt
+            self.previous_error = error
+            output = self.kp * error + self.ki * self.integral + self.kd * derivative
+            return max(-self.output_limit, min(self.output_limit, output))
+
+    class FixedRateScheduler:
+        def __init__(self, hz=CONTROL_HZ, max_steps=5):
+            self.dt = 1.0 / float(hz)
+            self.max_steps = int(max_steps)
+            self.accumulator = 0.0
+
+        def advance(self, elapsed):
+            self.accumulator += max(0.0, elapsed)
+            steps = 0
+            while self.accumulator + 1e-12 >= self.dt and steps < self.max_steps:
+                self.accumulator -= self.dt
+                steps += 1
+            return steps
+
+    def approach(current, target, maximum_delta):
+        delta = float(target) - float(current)
+        if abs(delta) <= maximum_delta:
+            return float(target)
+        return float(current) + math.copysign(maximum_delta, delta)
 
 class Material:
     def __init__(self):
@@ -165,7 +277,7 @@ class Object3D:
 
         glEnable(GL_DEPTH_TEST)
         glDepthMask(GL_TRUE)
-#meshes
+
 def create_prism_mesh(l, w, h):
     l, w, h = l/2, w/2, h/2
 
@@ -250,7 +362,6 @@ def create_sphere_mesh(radius, stacks, slices):
 
     return Mesh(tuple(vertices), tuple(faces), tuple(edges), uvs=tuple(uvs))
 
-#3d object creation functions
 def create_prism(l, w, h, tex_id=None):
     mesh = create_prism_mesh(l, w, h)
     obj = Object3D(mesh)
@@ -291,7 +402,6 @@ def create_skybox(size, front=None, back=None, top=None, bottom=None, left=None,
     obj.edge_color = (0, 0, 0)
     return obj
 
-#general fucntions
 def start():
     pygame.init()
     display = (display_x, display_y)
@@ -571,62 +681,146 @@ def solve_weight(mass, gravity):
 arm_lengths = (4.0, 3.0, 2.0)
 joint_names = ("base", "shoulder", "elbow", "wrist")
 joint_limits = ((-180.0, 180.0), (-90.0, 90.0), (-135.0, 135.0), (-90.0, 90.0))
+minimum_target_y = -0.35
+posture_bias = 0.08
 
 def arm_end_position(angles):
     yaw, shoulder, elbow, wrist = [math.radians(value) for value in angles]
     pitches = (shoulder, shoulder + elbow, shoulder + elbow + wrist)
-    radius = sum(length * math.sin(pitch) for length, pitch in zip(arm_lengths, pitches))
-    height = sum(length * math.cos(pitch) for length, pitch in zip(arm_lengths, pitches))
-    return np.array((math.sin(yaw) * radius, height, -math.cos(yaw) * radius))
+    depth = sum(length * math.cos(pitch) for length, pitch in zip(arm_lengths, pitches))
+    height = 1.0 + sum(length * math.sin(pitch) for length, pitch in zip(arm_lengths, pitches))
+    return np.array((math.sin(yaw) * depth, height, -math.cos(yaw) * depth))
 
 def solve_arm_ik(target, starting_angles):
-    angles = np.array(starting_angles, dtype=float)
+    if isinstance(target, dict):
+        target = (target["x"], target["y"], target["z"])
     target = np.array(target, dtype=float)
-
-    for _ in range(80):
-        error = target - arm_end_position(angles)
-        if np.linalg.norm(error) < 0.01:
+    angles = np.array(starting_angles, dtype=float)
+    target[1] = max(minimum_target_y + 0.02, target[1])
+    posture = np.array([angles[0], 35.0, -20.0, 0.0])
+    for _ in range(120):
+        position = arm_end_position(angles)
+        error = target - position
+        if np.linalg.norm(error) < 0.001:
             break
 
         jacobian = np.zeros((3, 4))
         for index in range(4):
             probe = angles.copy()
             probe[index] += 0.1
-            jacobian[:, index] = (arm_end_position(probe) - arm_end_position(angles)) / 0.1
+            jacobian[:, index] = (arm_end_position(probe) - position) / 0.1
 
         damping = 0.15
-        step = jacobian.T @ np.linalg.solve(
+        correction = jacobian.T @ np.linalg.solve(
             jacobian @ jacobian.T + damping ** 2 * np.eye(3), error
         )
-        angles += step
-        for index, (low, high) in enumerate(joint_limits):
-            angles[index] = np.clip(angles[index], low, high)
-
+        null_space = np.eye(4) - np.linalg.pinv(jacobian) @ jacobian
+        correction += null_space @ ((posture - angles) * posture_bias)
+        angles += correction
+    for index, (low, high) in enumerate(joint_limits):
+        angles[index] = np.clip(angles[index], low, high)
     return angles
 
-def draw_control_panel(target, angles, selected_axis, selected_joint, ik_enabled):
+def draw_slider(label, value, low, high, x, y, width=230):
+    draw_text(f"{label}: {value:.2f}", x, y - 18, 16, (205, 215, 225))
+    draw_rect(x, y, width, 7, color=(0.25, 0.29, 0.35))
+    fraction = (value - low) / (high - low) if high > low else 0.0
+    draw_rect(x, y, width * max(0.0, min(1.0, fraction)), 7, color=(1.0, 0.72, 0.22))
+
+def draw_control_panel(target, angles, selected_axis, selected_joint, ik_enabled,
+                       settings, pose_name, settings_panel):
     panel_x = 15
     panel_y = 70
     panel_width = 360
-    panel_height = 265
+    panel_height = 930 if settings_panel else 265
     draw_rect(panel_x, panel_y, panel_width, panel_height, color=(0.04, 0.06, 0.10))
     draw_text("ROBOT ARM CONTROL", panel_x + 15, panel_y + 12, 26, (255, 220, 120))
-    mode = "IK POSITION" if ik_enabled else "JOINT ANGLES"
-    draw_text(f"MODE: {mode}   [TAB] switch", panel_x + 15, panel_y + 45, 20, (210, 230, 245))
+    draw_text("MODE: END EFFECTOR POSITION", panel_x + 15, panel_y + 45, 20, (210, 230, 245))
 
     target_color = (255, 220, 120) if ik_enabled else (180, 190, 205)
     draw_text(
         f"TARGET {selected_axis.upper()}: {target[selected_axis]: .2f}  [X/Y/Z]",
         panel_x + 15, panel_y + 76, 20, target_color
     )
-    draw_text("Arrows: change selected value", panel_x + 15, panel_y + 102, 18, (180, 190, 205))
-    draw_text("Shift + arrows: fine adjustment", panel_x + 15, panel_y + 125, 18, (180, 190, 205))
+    draw_text("J/L + I/K: move target", panel_x + 15, panel_y + 102, 18, (180, 190, 205))
+    draw_text("Shift + keys: fine adjustment", panel_x + 15, panel_y + 125, 18, (180, 190, 205))
     draw_text(f"JOINT: {joint_names[selected_joint]}  [1-4] select", panel_x + 15, panel_y + 158, 20, (210, 230, 245))
     draw_text(
         f"ANGLES: {angles[0]: .0f} {angles[1]: .0f} {angles[2]: .0f} {angles[3]: .0f}",
         panel_x + 15, panel_y + 184, 18, (180, 190, 205)
     )
-    draw_text("[I] IK   [R] reset   [ESC] release mouse", panel_x + 15, panel_y + 218, 18, (180, 190, 205))
+    draw_text("[I] IK [R] reset [F2] settings [F5] save [F7] load", panel_x + 15, panel_y + 218, 17, (180, 190, 205))
+    draw_text(f"CONTROL: {CONTROL_HZ:.0f} Hz   POSE: {pose_name}", panel_x + 15, panel_y + 242, 17, (180, 190, 205))
+    if settings_panel:
+        draw_text("SETTINGS (drag sliders)", panel_x + 15, panel_y + 275, 20, (255, 220, 120))
+        draw_slider("P", settings["pid"]["p"][selected_joint], 0, 30, panel_x + 15, panel_y + 315)
+        draw_slider("I", settings["pid"]["i"][selected_joint], 0, 5, panel_x + 15, panel_y + 355)
+        draw_slider("D", settings["pid"]["d"][selected_joint], 0, 5, panel_x + 15, panel_y + 395)
+        draw_slider("Max speed", settings["max_joint_speed"], 5, 360, panel_x + 15, panel_y + 435)
+        draw_slider("Posture bias", settings["posture_bias"], 0, 1, panel_x + 15, panel_y + 475)
+        draw_slider("Target X", target["x"], -20, 20, panel_x + 15, panel_y + 515)
+        draw_slider("Target Y", target["y"], -1, 15, panel_x + 15, panel_y + 555)
+        draw_slider("Target Z", target["z"], -20, 10, panel_x + 15, panel_y + 595)
+        draw_slider("End roll", target_orientation["roll"], -180, 180, panel_x + 15, panel_y + 635)
+        draw_slider("End pitch", target_orientation["pitch"], -180, 180, panel_x + 15, panel_y + 675)
+        draw_slider("End yaw", target_orientation["yaw"], -180, 180, panel_x + 15, panel_y + 715)
+
+def reset_pid_controllers():
+    for controller in pid_controllers:
+        controller.reset()
+
+def save_current_settings():
+    settings["posture_bias"] = posture_bias
+    settings["minimum_target_y"] = minimum_target_y
+    save_json(settings_path, settings)
+
+def save_current_pose(name):
+    saved = [pose for pose in poses if pose["name"] != name]
+    saved.append({
+        "name": name,
+        "target": dict(target_position),
+        "orientation": dict(target_orientation),
+        "angles": list(target_angles),
+    })
+    save_json(poses_path, saved)
+    return saved
+
+def set_slider_value(mouse_x, x, width, low, high):
+    fraction = max(0.0, min(1.0, (mouse_x - x) / width))
+    return low + fraction * (high - low)
+
+def update_slider_value(slider, mouse_x):
+    if slider == "i_selected":
+        settings["pid"]["i"][selected_joint] = set_slider_value(mouse_x, 30, 230, 0, 5)
+    elif slider == "d_selected":
+        settings["pid"]["d"][selected_joint] = set_slider_value(mouse_x, 30, 230, 0, 5)
+    elif slider == "p_selected":
+        settings["pid"]["p"][selected_joint] = set_slider_value(mouse_x, 30, 230, 0, 30)
+    elif slider == "max_speed":
+        settings["max_joint_speed"] = set_slider_value(mouse_x, 30, 230, 5, 360)
+    elif slider == "posture_bias":
+        globals()["posture_bias"] = set_slider_value(mouse_x, 30, 230, 0, 1)
+        settings["posture_bias"] = posture_bias
+    elif slider == "target":
+        target_position[selected_axis] = set_slider_value(mouse_x, 30, 230, -10, 10)
+    elif slider == "target_x":
+        target_position["x"] = set_slider_value(mouse_x, 30, 230, -20, 20)
+    elif slider == "target_y":
+        target_position["y"] = set_slider_value(mouse_x, 30, 230, -1, 15)
+    elif slider == "target_z":
+        target_position["z"] = set_slider_value(mouse_x, 30, 230, -20, 10)
+    elif slider == "orientation_roll":
+        target_orientation["roll"] = set_slider_value(mouse_x, 30, 230, -180, 180)
+    elif slider == "orientation_pitch":
+        target_orientation["pitch"] = set_slider_value(mouse_x, 30, 230, -180, 180)
+    elif slider == "orientation_yaw":
+        target_orientation["yaw"] = set_slider_value(mouse_x, 30, 230, -180, 180)
+    if slider in ("p_selected", "i_selected", "d_selected"):
+        index = selected_joint
+        pid_controllers[index].kp = settings["pid"]["p"][index]
+        pid_controllers[index].ki = settings["pid"]["i"][index]
+        pid_controllers[index].kd = settings["pid"]["d"][index]
+
 # var
 display_x = 1500
 display_y = 1200
@@ -651,6 +845,16 @@ x = 0
 setup_pos = True
 fps = 60
 
+settings_path = Path(__file__).with_name("settings.json")
+poses_path = Path(__file__).with_name("poses.json")
+settings = load_settings(settings_path)
+posture_bias = settings["posture_bias"]
+poses = load_poses(poses_path)
+pose_name = "home"
+settings_panel = False
+slider_drag = None
+camera_control_enabled = True
+
 clock = pygame.time.Clock()
 screen = start()
 
@@ -661,6 +865,25 @@ base_yaw = 0
 shoulder_pitch = 0
 elbow_pitch = 0
 wrist_pitch = 0
+joint_angles = [base_yaw, shoulder_pitch, elbow_pitch, wrist_pitch]
+target_angles = joint_angles.copy()
+target_position = {"x": 0.0, "y": 1.0, "z": -9.0}
+target_orientation = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+selected_axis = "x"
+selected_joint = 0
+ik_enabled = True
+control_scheduler = FixedRateScheduler(CONTROL_HZ)
+pid_controllers = [
+    PID(
+        settings["pid"]["p"][index],
+        settings["pid"]["i"][index],
+        settings["pid"]["d"][index],
+        settings["pid"]["integral_limit"],
+        settings["pid"]["output_limit"],
+    )
+    for index in range(4)
+]
+last_frame_time = time.perf_counter()
 
 # textures 
 six_seven = load_image("67.png")
@@ -681,7 +904,8 @@ base      = create_prism(2, 2, 2, tex_id=six_seven)
 segment_1 = create_prism(1, 1, 4, tex_id=six_seven)
 segment_2 = create_prism(1, 1, 3, tex_id=six_seven)
 segment_3 = create_prism(1, 1, 2, tex_id=fourty_one)
-claw      = create_sphere(0.5, 16, 16, tex_id=six_seven)
+claw      = create_prism(1.2, 1.0, 0.8, tex_id=six_seven)
+orientation_marker = create_prism(0.25, 2.0, 0.25, tex_id=fourty_one)
 ground = create_prism(50, 50, 0.1, tex_id=pumpkin_cat)
 oli_sphere = create_sphere(2, 16, 16, tex_id=oli)
 
@@ -708,40 +932,132 @@ segment_3.add_child(claw)
 
 # main
 while True:
-    mouse_dx, mouse_dy = pygame.mouse.get_rel()
-    cam_ry += mouse_dx * mouse_sensitivity
-    cam_rx += mouse_dy * mouse_sensitivity
-    cam_rx = max(-90, min(90, cam_rx))
+    if camera_control_enabled:
+        mouse_dx, mouse_dy = pygame.mouse.get_rel()
+        cam_ry += mouse_dx * mouse_sensitivity
+        cam_rx += mouse_dy * mouse_sensitivity
+        cam_rx = max(-90, min(90, cam_rx))
+    else:
+        pygame.mouse.get_rel()
 
     key = pygame.key.get_pressed()
-    if key[K_w]:
-        cam_x += math.sin(math.radians(cam_ry)) * cam_move_speed
-        cam_z -= math.cos(math.radians(cam_ry)) * cam_move_speed
-    if key[K_s]:
-        cam_x -= math.sin(math.radians(cam_ry)) * cam_move_speed
-        cam_z += math.cos(math.radians(cam_ry)) * cam_move_speed
-    if key[K_a]:
-        cam_x -= math.cos(math.radians(cam_ry)) * cam_move_speed
-        cam_z -= math.sin(math.radians(cam_ry)) * cam_move_speed
-    if key[K_d]:
-        cam_x += math.cos(math.radians(cam_ry)) * cam_move_speed
-        cam_z += math.sin(math.radians(cam_ry)) * cam_move_speed
-    if key[K_SPACE]:
-        cam_y += cam_move_speed
-    if key[K_LCTRL]:
-        cam_y -= cam_move_speed
+    if camera_control_enabled:
+        if key[K_w]:
+            cam_x += math.sin(math.radians(cam_ry)) * cam_move_speed
+            cam_z -= math.cos(math.radians(cam_ry)) * cam_move_speed
+        if key[K_s]:
+            cam_x -= math.sin(math.radians(cam_ry)) * cam_move_speed
+            cam_z += math.cos(math.radians(cam_ry)) * cam_move_speed
+        if key[K_a]:
+            cam_x -= math.cos(math.radians(cam_ry)) * cam_move_speed
+            cam_z -= math.sin(math.radians(cam_ry)) * cam_move_speed
+        if key[K_d]:
+            cam_x += math.cos(math.radians(cam_ry)) * cam_move_speed
+            cam_z += math.sin(math.radians(cam_ry)) * cam_move_speed
+        if key[K_SPACE]:
+            cam_y += cam_move_speed
+        if key[K_LCTRL]:
+            cam_y -= cam_move_speed
 
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             pygame.quit()
             quit()
         if event.type == pygame.KEYDOWN:
+            if event.key == K_TAB:
+                ik_enabled = True
+            elif event.key == K_i:
+                ik_enabled = True
+            elif event.key == K_F2:
+                settings_panel = not settings_panel
+            elif event.key == K_F5:
+                save_current_settings()
+                pose_name = "quick-save"
+                poses = save_current_pose(pose_name)
+            elif event.key == K_F7:
+                loaded = next((pose for pose in poses if pose["name"] == "quick-save"), None)
+                if loaded is not None:
+                    target_position = dict(loaded["target"])
+                    target_orientation = dict(loaded.get("orientation", target_orientation))
+                    target_angles = list(loaded["angles"])
+                    joint_angles = list(target_angles)
+                    reset_pid_controllers()
+            elif event.key == K_r:
+                joint_angles = [0.0, 0.0, 0.0, 0.0]
+                target_angles = joint_angles.copy()
+                target_position = {"x": 0.0, "y": 1.0, "z": -9.0}
+                target_orientation = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+                reset_pid_controllers()
+            elif event.key in (K_x, K_y, K_z):
+                selected_axis = pygame.key.name(event.key)
+            elif event.key in (K_1, K_2, K_3, K_4):
+                selected_joint = event.key - K_1
+            elif event.key in (K_j, K_l, K_i, K_k):
+                direction = 1 if event.key in (K_l, K_i) else -1
+                step = 0.025 if event.mod & KMOD_SHIFT else 0.1
+                target_position[selected_axis] += direction * step
             if event.key == K_ESCAPE:
+                camera_control_enabled = False
                 pygame.event.set_grab(False)
                 pygame.mouse.set_visible(True)
         if event.type == pygame.MOUSEBUTTONDOWN:
-            pygame.event.set_grab(True)
-            pygame.mouse.set_visible(False)
+            clicked_settings_panel = settings_panel and 15 <= event.pos[0] <= 375 and 70 <= event.pos[1] <= 1000
+            if clicked_settings_panel and event.button == 1:
+                panel_y = 70
+                if panel_y + 297 <= event.pos[1] <= panel_y + 325:
+                    slider_drag = "p_selected"
+                elif panel_y + 337 <= event.pos[1] <= panel_y + 365:
+                    slider_drag = "i_selected"
+                elif panel_y + 377 <= event.pos[1] <= panel_y + 405:
+                    slider_drag = "d_selected"
+                elif panel_y + 417 <= event.pos[1] <= panel_y + 445:
+                    slider_drag = "max_speed"
+                elif panel_y + 457 <= event.pos[1] <= panel_y + 485:
+                    slider_drag = "posture_bias"
+                elif panel_y + 497 <= event.pos[1] <= panel_y + 525:
+                    slider_drag = "target_x"
+                elif panel_y + 537 <= event.pos[1] <= panel_y + 565:
+                    slider_drag = "target_y"
+                elif panel_y + 577 <= event.pos[1] <= panel_y + 605:
+                    slider_drag = "target_z"
+                elif panel_y + 617 <= event.pos[1] <= panel_y + 645:
+                    slider_drag = "orientation_roll"
+                elif panel_y + 657 <= event.pos[1] <= panel_y + 685:
+                    slider_drag = "orientation_pitch"
+                elif panel_y + 697 <= event.pos[1] <= panel_y + 725:
+                    slider_drag = "orientation_yaw"
+                if slider_drag:
+                    update_slider_value(slider_drag, event.pos[0])
+                camera_control_enabled = False
+                pygame.event.set_grab(False)
+                pygame.mouse.set_visible(True)
+            else:
+                camera_control_enabled = True
+                pygame.event.set_grab(True)
+                pygame.mouse.set_visible(False)
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            slider_drag = None
+        if event.type == pygame.MOUSEMOTION and slider_drag:
+            update_slider_value(slider_drag, event.pos[0])
+
+    elapsed = time.perf_counter() - last_frame_time
+    last_frame_time += elapsed
+    for _ in range(control_scheduler.advance(elapsed)):
+        if ik_enabled:
+            target_angles = solve_arm_ik(target_position, target_angles).tolist()
+        for index, controller in enumerate(pid_controllers):
+            correction = controller.update(
+                target_angles[index], joint_angles[index], CONTROL_DT
+            )
+            correction = max(
+                -settings["max_joint_speed"],
+                min(settings["max_joint_speed"], correction),
+            )
+            joint_angles[index] = approach(
+                joint_angles[index],
+                joint_angles[index] + correction * CONTROL_DT,
+                settings["max_joint_speed"] * CONTROL_DT,
+            )
             
 #run once when setup stuff
     if setup_pos:
@@ -775,11 +1091,25 @@ while True:
 
     skybox.render_skybox()
 
+    base_yaw, shoulder_pitch, elbow_pitch, wrist_pitch = joint_angles
     base.rotate_around_point(0, 0, 0, 0, base_yaw, 0)
     segment_1.rotate_around_point(0, 0, 2, shoulder_pitch, 0, 0)
     segment_1.translate(0, 1, -2)
     segment_2.rotate_around_point(0, 0, 1.5, elbow_pitch, 0, 0)
     segment_3.rotate_around_point(0, 0, 1, wrist_pitch, 0, 0)
+    claw.rotate(
+        target_orientation["pitch"],
+        target_orientation["yaw"],
+        target_orientation["roll"],
+    )
+    orientation_marker.translate(
+        target_position["x"], target_position["y"], target_position["z"]
+    )
+    orientation_marker.rotate(
+        target_orientation["pitch"],
+        target_orientation["yaw"],
+        target_orientation["roll"],
+    )
     
     
     planes = get_frustum_planes()
@@ -787,10 +1117,15 @@ while True:
     base.render(planes)
     ground.render()
     oli_sphere.render()
+    orientation_marker.render()
 
     draw_2d_start()
     draw_rect(10, 10, 200, 40, color=(0.0, 0.0, 0.0))
     draw_text(f"cam pos: {cam_x:.1f} {cam_y:.1f} {cam_z:.1f}", 15, 20, 24, (255, 255, 255))
+    draw_control_panel(
+        target_position, joint_angles, selected_axis, selected_joint, ik_enabled,
+        settings, pose_name, settings_panel
+    )
     draw_2d_end()
 
     pygame.display.flip()

@@ -567,66 +567,6 @@ def solve_torque(r, f, o):
 
 def solve_weight(mass, gravity):
     return mass * gravity
-
-arm_lengths = (4.0, 3.0, 2.0)
-joint_names = ("base", "shoulder", "elbow", "wrist")
-joint_limits = ((-180.0, 180.0), (-90.0, 90.0), (-135.0, 135.0), (-90.0, 90.0))
-
-def arm_end_position(angles):
-    yaw, shoulder, elbow, wrist = [math.radians(value) for value in angles]
-    pitches = (shoulder, shoulder + elbow, shoulder + elbow + wrist)
-    radius = sum(length * math.sin(pitch) for length, pitch in zip(arm_lengths, pitches))
-    height = sum(length * math.cos(pitch) for length, pitch in zip(arm_lengths, pitches))
-    return np.array((math.sin(yaw) * radius, height, -math.cos(yaw) * radius))
-
-def solve_arm_ik(target, starting_angles):
-    angles = np.array(starting_angles, dtype=float)
-    target = np.array(target, dtype=float)
-
-    for _ in range(80):
-        error = target - arm_end_position(angles)
-        if np.linalg.norm(error) < 0.01:
-            break
-
-        jacobian = np.zeros((3, 4))
-        for index in range(4):
-            probe = angles.copy()
-            probe[index] += 0.1
-            jacobian[:, index] = (arm_end_position(probe) - arm_end_position(angles)) / 0.1
-
-        damping = 0.15
-        step = jacobian.T @ np.linalg.solve(
-            jacobian @ jacobian.T + damping ** 2 * np.eye(3), error
-        )
-        angles += step
-        for index, (low, high) in enumerate(joint_limits):
-            angles[index] = np.clip(angles[index], low, high)
-
-    return angles
-
-def draw_control_panel(target, angles, selected_axis, selected_joint, ik_enabled):
-    panel_x = 15
-    panel_y = 70
-    panel_width = 360
-    panel_height = 265
-    draw_rect(panel_x, panel_y, panel_width, panel_height, color=(0.04, 0.06, 0.10))
-    draw_text("ROBOT ARM CONTROL", panel_x + 15, panel_y + 12, 26, (255, 220, 120))
-    mode = "IK POSITION" if ik_enabled else "JOINT ANGLES"
-    draw_text(f"MODE: {mode}   [TAB] switch", panel_x + 15, panel_y + 45, 20, (210, 230, 245))
-
-    target_color = (255, 220, 120) if ik_enabled else (180, 190, 205)
-    draw_text(
-        f"TARGET {selected_axis.upper()}: {target[selected_axis]: .2f}  [X/Y/Z]",
-        panel_x + 15, panel_y + 76, 20, target_color
-    )
-    draw_text("Arrows: change selected value", panel_x + 15, panel_y + 102, 18, (180, 190, 205))
-    draw_text("Shift + arrows: fine adjustment", panel_x + 15, panel_y + 125, 18, (180, 190, 205))
-    draw_text(f"JOINT: {joint_names[selected_joint]}  [1-4] select", panel_x + 15, panel_y + 158, 20, (210, 230, 245))
-    draw_text(
-        f"ANGLES: {angles[0]: .0f} {angles[1]: .0f} {angles[2]: .0f} {angles[3]: .0f}",
-        panel_x + 15, panel_y + 184, 18, (180, 190, 205)
-    )
-    draw_text("[I] IK   [R] reset   [ESC] release mouse", panel_x + 15, panel_y + 218, 18, (180, 190, 205))
 # var
 display_x = 1500
 display_y = 1200
