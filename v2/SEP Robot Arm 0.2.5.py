@@ -1073,7 +1073,7 @@ while True:
         
         ground.rotate(90, 0, 0)
         ground.translate(0, -1, 0)
-        oli_sphere.translate(0, 4, 5)
+        oli_sphere.translate(0, 4, -3)
         oli_sphere.rotate(0, 90, 0)
         
         setup_pos = False
