@@ -681,7 +681,7 @@ def solve_weight(mass, gravity):
 
 arm_lengths = (4.0, 3.0, 2.0)
 joint_names = ("base", "shoulder", "elbow", "wrist")
-joint_limits = ((-180.0, 180.0), (-90.0, 90.0), (-135.0, 135.0), (-90.0, 90.0))
+joint_limits = ((-math.inf, math.inf), (-90.0, 90.0), (-135.0, 135.0), (-90.0, 90.0))
 minimum_target_y = -1.0
 posture_bias = 0.08
 
@@ -741,6 +741,9 @@ def solve_arm_ik(target, orientation, starting_angles, angle_weight):
     target = np.array(target, dtype=float)
     target[1] = max(minimum_target_y, target[1])
     angles = np.array(starting_angles, dtype=float)
+    if abs(target[0]) > 1e-9 or abs(target[2]) > 1e-9:
+        desired_yaw = math.degrees(math.atan2(-target[0], -target[2]))
+        angles[0] += angle_difference(desired_yaw, angles[0])
     target_orientation = np.array((orientation["yaw"], orientation["pitch"]))
     orientation_weight = max(0.0, min(1.0, float(angle_weight))) * 0.05
     posture = np.array([angles[0], 35.0, -20.0, 0.0])

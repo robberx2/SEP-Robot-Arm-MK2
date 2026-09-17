@@ -23,6 +23,8 @@ From the repository root, run:
 
 The IK solver follows the target position and can blend toward the target yaw and pitch. The `Angle weight` slider controls that blend from position-first (`0`) to stronger angle influence (`1`). The end effector is kept at or above `Y = -1`. The target Z coordinate is not clamped by the robot controller.
 
+The base joint can rotate continuously past `180` degrees so the arm can reach behind itself. The shoulder, elbow, and wrist joint limits remain active.
+
 ## Settings sliders
 
 Press `F2` to adjust PID gains, maximum joint speed, posture bias, angle weight, target coordinates, and end-effector roll, pitch, and yaw from `-180` to `180` degrees.
