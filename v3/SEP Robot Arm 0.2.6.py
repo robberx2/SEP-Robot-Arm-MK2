@@ -816,7 +816,7 @@ def draw_control_panel(target, angles, selected_axis, selected_joint, ik_enabled
         draw_slider("D", settings["pid"]["d"][selected_joint], 0, 5, panel_x + 15, panel_y + 395)
         draw_slider("Max speed", settings["max_joint_speed"], 5, 360, panel_x + 15, panel_y + 435)
         draw_slider("Posture bias", settings["posture_bias"], 0, 1, panel_x + 15, panel_y + 475)
-        draw_slider("Angle weight", settings["angle_weight"], 0, 1, panel_x + 15, panel_y + 515)
+        draw_slider("Angle weight", settings.get("angle_weight", 0.1), 0, 1, panel_x + 15, panel_y + 515)
         draw_slider("Target X", target["x"], -20, 20, panel_x + 15, panel_y + 555)
         draw_slider("Target Y", target["y"], -1, 15, panel_x + 15, panel_y + 595)
         draw_slider("Target Z", target["z"], -20, 10, panel_x + 15, panel_y + 635)
@@ -912,7 +912,8 @@ settings_path = Path(__file__).with_name("settings.json")
 poses_path = Path(__file__).with_name("poses.json")
 settings = load_settings(settings_path)
 posture_bias = settings["posture_bias"]
-angle_weight = settings["angle_weight"]
+angle_weight = float(settings.get("angle_weight", 0.1))
+settings["angle_weight"] = angle_weight
 poses = load_poses(poses_path)
 pose_name = "home"
 settings_panel = False

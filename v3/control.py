@@ -81,6 +81,8 @@ def load_settings(path):
     settings["control_hz"] = CONTROL_HZ
     settings["max_joint_speed"] = _number(settings["max_joint_speed"], 90.0, 1.0)
     settings["posture_bias"] = _number(settings["posture_bias"], 0.35, 0.0)
+    settings["angle_weight"] = _number(settings.get("angle_weight"), 0.1, 0.0)
+    settings["angle_weight"] = min(1.0, settings["angle_weight"])
     settings["minimum_target_y"] = _number(settings["minimum_target_y"], -1.0)
     for key in ("p", "i", "d"):
         values = settings["pid"][key]
