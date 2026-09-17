@@ -12,6 +12,7 @@ DEFAULT_SETTINGS = {
     "control_hz": CONTROL_HZ,
     "max_joint_speed": 90.0,
     "posture_bias": 0.08,
+    "angle_weight": 0.1,
     "minimum_target_y": -1.0,
     "pid": {
         "p": [5.0, 6.0, 6.0, 4.0],
