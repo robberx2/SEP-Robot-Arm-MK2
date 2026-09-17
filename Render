@@ -1,0 +1,545 @@
+import numpy as np
+import time
+from multiprocessing import Process, Queue
+
+l1 = 5
+l2 = 10
+l3 = 10
+l4 = 5
+l5 = 2
+
+angles = np.radians([
+    0,    
+    90,   
+    0,    
+    0,    
+    0,    
+    0     
+])
+
+def rot_x(t):
+
+    c = np.cos(t)
+    s = np.sin(t)
+
+    return np.array([
+        [1,0,0],
+        [0,c,-s],
+        [0,s,c]
+    ])
+
+def rot_y(t):
+
+    c = np.cos(t)
+    s = np.sin(t)
+
+    return np.array([
+        [c,0,s],
+        [0,1,0],
+        [-s,0,c]
+    ])
+
+def rot_z(t):
+
+    c = np.cos(t)
+    s = np.sin(t)
+
+    return np.array([
+        [c,-s,0],
+        [s,c,0],
+        [0,0,1]
+    ])
+
+def transform(R,p):
+
+    T = np.eye(4)
+
+    T[:3,:3] = R
+    T[:3,3] = p
+
+    return T
+
+def forward_kinematics(q):
+
+    T = np.eye(4)
+
+    joints = []
+    axes = []
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,2].copy())
+
+    T = T @ transform(rot_z(q[0]),[0,0,0])
+    T = T @ transform(np.eye(3),[0,0,l1])
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,1].copy())
+
+    T = T @ transform(rot_y(q[1]),[0,0,0])
+    T = T @ transform(np.eye(3),[l2,0,0])
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,1].copy())
+
+    T = T @ transform(rot_y(q[2]),[0,0,0])
+    T = T @ transform(np.eye(3),[l3,0,0])
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,1].copy())
+
+    T = T @ transform(rot_y(q[3]),[0,0,0])
+    T = T @ transform(np.eye(3),[l4,0,0])
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,0].copy())
+
+    T = T @ transform(rot_x(q[4]),[0,0,0])
+    T = T @ transform(np.eye(3),[l5,0,0])
+
+    joints.append(T[:3,3].copy())
+    axes.append(T[:3,2].copy())
+
+
+    T = T @ transform(rot_z(q[5]),[0,0,0])
+
+    return (
+        T[:3,3],
+        T[:3,:3],
+        np.array(joints),
+        np.array(axes)
+    )
+
+def rotation_matrix_from_euler(
+    roll,
+    pitch,
+    yaw
+):
+
+    return (
+        rot_z(np.radians(yaw))
+        @
+        rot_y(np.radians(pitch))
+        @
+        rot_x(np.radians(roll))
+    )
+
+def rotation_error(current,target):
+
+    R = target @ current.T
+
+    return np.array([
+
+        R[2,1]-R[1,2],
+        R[0,2]-R[2,0],
+        R[1,0]-R[0,1]
+
+    ]) * 0.5
+
+def jacobian(end,joints,axes):
+
+    J = np.zeros((6,6))
+
+    for i in range(6):
+
+        r = end - joints[i]
+
+        J[:3,i] = np.cross(
+            axes[i],
+            r
+        )
+
+        J[3:,i] = axes[i]
+
+    return J
+
+class PID:
+
+    def __init__(
+        self,
+        kp,
+        ki,
+        kd,
+        integral_limit=None,
+        output_limit=None
+    ):
+
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+
+        self.integral = 0
+        self.previous_error = 0
+        self.derivative = 0
+
+        self.integral_limit = integral_limit
+        self.output_limit = output_limit
+
+
+    def update(
+        self,
+        target,
+        current,
+        dt
+    ):
+
+        error = target - current
+
+        self.integral += error * dt
+
+        if self.integral_limit:
+
+            self.integral = np.clip(
+                self.integral,
+                -self.integral_limit,
+                self.integral_limit
+            )
+
+        raw_derivative = (
+            error - self.previous_error
+        ) / dt
+
+
+        self.derivative = (
+            0.8 * self.derivative
+            +
+            0.2 * raw_derivative
+        )
+
+        self.previous_error = error
+
+
+        output = (
+            self.kp * error
+            +
+            self.ki * self.integral
+            +
+            self.kd * self.derivative
+        )
+
+        if self.output_limit:
+
+            output = np.clip(
+                output,
+                -self.output_limit,
+                self.output_limit
+            )
+
+
+        return output
+def solve_angles(queue):
+
+    print("the children have spawned")
+    
+    global angles
+
+    try:
+        for iteration in range(300):
+
+            end, R, joints, axes = forward_kinematics(
+                angles
+            )
+
+            position_error = target - end
+
+            orientation_error = rotation_error(
+                R,
+                target_rotation
+            )
+
+            error = np.concatenate(
+                (   
+                    position_error,
+                    orientation_error * 0.02
+                )
+            )
+
+            if np.linalg.norm(position_error) < 0.00000001:
+
+                print("ik done")
+                break
+
+            J = jacobian(
+                end,
+                joints,
+                axes
+            )
+
+            damping = 0.05
+
+
+            JJ = (
+                J @ J.T
+                +
+                damping**2*np.eye(6)
+            )
+            print("before solve", iteration)
+            dtheta = (
+                J.T
+                @
+                np.linalg.solve(
+                    JJ,
+                    error
+                )
+            )
+            print("after solve", iteration)
+            center = np.zeros(6)
+
+            secondary = (
+                -0.05
+                *
+                (angles-center)
+            )
+
+            N = (
+                np.eye(6)
+                -
+                np.linalg.pinv(J)
+                @
+                J
+            )
+
+            dtheta += N @ secondary
+
+            step = min(
+                0.15,
+                0.02 +
+                np.linalg.norm(position_error)*0.01
+            )
+
+            angles += dtheta * step
+
+            limits = [
+
+                (-180,180),
+                (-90,90),
+                (-135,135),
+                (-90,90),
+                (-180,180),
+                (-180,180)
+
+            ]
+
+            for i,(low,high) in enumerate(limits):
+
+                angles[i] = np.clip(
+                    angles[i],
+                    np.radians(low),
+                    np.radians(high)
+                )
+            if iteration % 10 == 0:
+                print(iteration, np.linalg.norm(position_error))
+                
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        queue.put(("ERROR", str(e)))
+
+    finally:
+        print("solved the stuff")
+        queue.put((angles.copy(), iteration + 1))
+        print("sent the stuff")
+
+print("stuff is defined")
+
+
+target = np.array([
+    20,
+    10,
+    10
+])
+
+
+target_rotation = rotation_matrix_from_euler(
+    0,
+    0,
+    0
+)
+
+
+if __name__ == "__main__":
+
+    print("Starting process")
+
+    queue = Queue()
+
+    p = Process(
+        target=solve_angles,
+        args=(queue,)
+    )
+
+    p.start()
+
+    print("Started")
+    target_angles, iterations = queue.get()
+
+    p.join()
+
+    print("Finished")
+
+
+    pid = [
+
+        PID(
+            5.0,
+            0.0,
+            0.35,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        ),
+
+        PID(
+            6.0,
+            0.0,
+            0.45,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        ),
+
+        PID(
+            6.0,
+            0.0,
+            0.45,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        ),
+
+        PID(
+            4.0,
+            0.0,
+            0.3,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        ),
+
+        PID(
+            4.0,
+            0.0,
+            0.3,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        ),
+
+        PID(
+            4.0,
+            0.0,
+            0.3,
+            integral_limit=np.radians(10),
+            output_limit=np.radians(180)
+        )
+
+    ]
+
+
+    current_angles = np.zeros(6)
+
+
+    dt = 0.02
+
+
+    print("\nMoving...")
+
+
+    while True:
+
+        reached = True
+
+
+        for i in range(6):
+
+            correction = pid[i].update(
+
+                target_angles[i],
+
+                current_angles[i],
+
+                dt
+
+            )
+
+
+            max_speed = np.radians(90)
+
+
+            correction = np.clip(
+                correction,
+                -max_speed,
+                max_speed
+            )
+
+
+            current_angles[i] += (
+                correction
+                *
+                dt
+            )
+
+
+            if abs(
+                target_angles[i]
+                -
+                current_angles[i]
+            ) > np.radians(0.5):
+
+                reached = False
+
+
+
+        print(
+            np.round(
+                np.degrees(current_angles),
+                2
+            )
+        )
+
+
+        if reached:
+
+            print("\nmovement success")
+
+            break
+
+
+        time.sleep(dt)
+
+
+
+    end, R, joints, axes = forward_kinematics(
+        current_angles
+    )
+
+
+    final_end, _, _, _ = forward_kinematics(
+        target_angles
+    )
+
+
+    final_error = np.linalg.norm(
+        target - final_end
+    )
+
+
+    print("\n========== IK STATS ==========")
+
+
+    print(
+        "iterations:",
+        iterations
+    )
+
+
+    print(
+        "error:",
+        final_error
+    )
+
+
+    print(
+        "position:",
+        final_end
+    )
+
+
+    print(
+        "target:",
+        target
+    )
